@@ -2,7 +2,7 @@
 
 * 版本 / Version: 1.1
 * 作者 / Author: 紫心醉梦
-* 框架 / Framework: Siralim Ultimate Mod Loader
+* 框架 / Framework: [Siralim Ultimate Mod Loader](https://github.com/yt213587946/Siralim-Ultimate-Mod-Loader/releases/tag/v1.0.0)
 
 ### Overview
 
