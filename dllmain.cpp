@@ -1,4 +1,4 @@
-﻿#include "pch.h"
+#include "pch.h"
 #include <windows.h>
 #include "MinHook.h"
 #include <string>
@@ -6,6 +6,8 @@
 #include <vector>
 #include <atomic>
 #include <mutex>
+#include <algorithm>
+#include <intrin.h>
 
 // ============================================================
 // 数据结构
@@ -63,6 +65,9 @@ static T* PtrFromImageVa(uintptr_t imageVa)
 
 static constexpr uintptr_t kFUN_1478bbd70 = 0x1478BBD70ULL;
 
+static constexpr uintptr_t kFUN_14028c410 = 0x14028C410ULL;
+static constexpr uintptr_t kFUN_14028c630 = 0x14028C630ULL;
+
 // ============================================================
 // 函数指针类型 & 原函数指针
 // ============================================================
@@ -75,7 +80,6 @@ typedef void* (__fastcall* GML_LootBox_Fn)(void*, void*, RValue*, int, RValue**)
 typedef void* (__fastcall* GML_Script_SG)(void*, void*, RValue*, int, RValue**);
 typedef void* (__fastcall* GML_Script_Fn)(void*, void*, RValue*);
 typedef void* (__fastcall* GML_Script_Ek)(void*, void*);
-typedef void* (__fastcall* GML_Assign_Fn)(RValue*, RValue*);
 typedef void* (__fastcall* GML_InvLoot_Fn)(void*, void*, RValue*, int, RValue**);
 typedef void* (__fastcall* CreateMiscFunc)(void*, void*, RValue*, int, RValue**);
 typedef void* (__fastcall* CreateMaterialFunc)(void*, void*, RValue*, int, RValue**);
@@ -89,6 +93,12 @@ typedef uint64_t(__fastcall* Fn_ReadVarById)(
     void* arg5,
     void* arg6);
 
+typedef void* (__fastcall* GML_Assign410_Fn)(RValue* dest, void* src);
+typedef void* (__fastcall* GML_Assign630_Fn)(RValue* dest, void* src);
+
+static GML_Assign410_Fn pOriginalAssign410 = nullptr;
+static GML_Assign630_Fn pOriginalAssign630 = nullptr;
+
 static GML_LoadCreature_Fn      pOriginalLoadCreature = nullptr;
 static GML_ScrFuse_Fn           pOriginalScrFuse = nullptr;
 static GML_NetherStoneCreate_Fn pOriginalNetherStoneCreate = nullptr;
@@ -97,7 +107,6 @@ static GML_LootBox_Fn           pOriginalLootBox = nullptr;
 static GML_Script_SG            pOriginalFavor = nullptr;
 static GML_Script_Fn            pOriginalResources = nullptr;
 static GML_Script_Fn            pOriginalGetLevel = nullptr;
-static GML_Assign_Fn            pOriginalAssign = nullptr;
 static GML_InvLoot_Fn           pOriginalInvLoot = nullptr;
 static GML_Script_Ek            pOriginalEmblemKeyPress = nullptr;
 static GML_Script_Ek            pOriginalMaterialKeyPress = nullptr;
@@ -110,7 +119,6 @@ static GML_TalismanMaxRank_Fn pOriginalTalismanMaxRank = nullptr;
 // 状态变量
 // ============================================================
 
-static bool g_InResource = false;
 static std::atomic<bool>     g_EmblemActive(false);
 static std::atomic<bool>     g_InExtra(false);
 static std::atomic<int>      g_LastEmblemID(-1);
@@ -119,9 +127,6 @@ static std::atomic<int>      g_LastMaterialID(-1);
 static std::atomic<bool>     g_InNetherStoneCreate(false);
 static std::atomic<int>      g_NetherStoneHighestLevel(1);
 static std::atomic<int>      g_NetherStoneBonusTenths(0);
-
-static std::vector<double>   g_ModifiedDoubles;
-static std::vector<long long> g_ModifiedInts;
 
 // ============================================================
 // 内存安全工具
@@ -153,6 +158,135 @@ static bool IsReadableRange(const void* p, size_t size)
         cur = (regionEnd < end) ? regionEnd : end;
     }
     return true;
+}
+
+// ============================================================
+// RewardResources 定向后处理上下文
+// ============================================================
+
+struct RewardCaptureContext
+{
+    bool active = false;              // 当前线程是否位于 bc_GetRewardResources
+    bool suppressCapture = false;     // 后处理阶段避免再次捕获
+    uintptr_t stackLow = 0;           // 当前线程栈下界
+    uintptr_t stackHigh = 0;          // 当前线程栈上界
+    std::vector<RValue*> writeOrder;  // 记录执行期间“非栈数值目标”的写入顺序
+};
+
+static thread_local RewardCaptureContext g_rewardCtx;
+
+// ============================================================
+// RewardResources 工具
+// ============================================================
+
+static bool IsNumericRValue(const RValue* v)
+{
+    return v && (v->type == 0 || v->type == 7 || v->type == 10);
+}
+
+static bool QueryCurrentThreadStackRange(uintptr_t* outLow, uintptr_t* outHigh)
+{
+    if (!outLow || !outHigh) return false;
+
+    typedef VOID(WINAPI* FnGetCurrentThreadStackLimits)(PULONG_PTR, PULONG_PTR);
+    static FnGetCurrentThreadStackLimits pGetCurrentThreadStackLimits =
+        (FnGetCurrentThreadStackLimits)GetProcAddress(
+            GetModuleHandleW(L"kernel32.dll"),
+            "GetCurrentThreadStackLimits");
+
+    if (pGetCurrentThreadStackLimits)
+    {
+        ULONG_PTR low = 0, high = 0;
+        pGetCurrentThreadStackLimits(&low, &high);
+        *outLow = (uintptr_t)low;
+        *outHigh = (uintptr_t)high;
+        return true;
+    }
+
+    // fallback：以局部变量为中心估算 ±2MB 栈窗口
+    char marker = 0;
+    uintptr_t p = (uintptr_t)&marker;
+    *outLow = (p > 0x200000) ? (p - 0x200000) : 0;
+    *outHigh = p + 0x200000;
+    return true;
+}
+
+static bool IsPtrOnCurrentStack(const void* p)
+{
+    if (!p || !g_rewardCtx.active) return false;
+    uintptr_t a = (uintptr_t)p;
+    return a >= g_rewardCtx.stackLow && a < g_rewardCtx.stackHigh;
+}
+
+static void ScaleRValueInPlace(RValue* v, double factor)
+{
+    if (!v) return;
+
+    if (v->type == 0)
+    {
+        v->value.v_double *= factor;
+    }
+    else if (v->type == 7 || v->type == 10)
+    {
+        v->value.v_int64 = (long long)((double)v->value.v_int64 * factor);
+    }
+}
+
+static std::vector<RValue*> CollectLastUniqueTargets(const std::vector<RValue*>& order, size_t wantCount)
+{
+    std::vector<RValue*> out;
+    out.reserve(wantCount);
+
+    for (auto it = order.rbegin(); it != order.rend(); ++it)
+    {
+        RValue* p = *it;
+        if (!p) continue;
+
+        bool exists = false;
+        for (RValue* e : out)
+        {
+            if (e == p)
+            {
+                exists = true;
+                break;
+            }
+        }
+
+        if (!exists)
+        {
+            out.push_back(p);
+            if (out.size() >= wantCount)
+                break;
+        }
+    }
+
+    std::reverse(out.begin(), out.end());
+    return out;
+}
+
+static void LogRewardTargets(const char* title, const std::vector<RValue*>& targets)
+{
+    if (!g_api) return;
+
+    char buf[256];
+    sprintf_s(buf, "%s: %zu target(s)", title, targets.size());
+    g_api->Log(buf);
+
+    for (size_t i = 0; i < targets.size(); ++i)
+    {
+        const RValue* v = targets[i];
+        if (!v || !IsReadableRange(v, sizeof(RValue)))
+            continue;
+
+        if (v->type == 0)
+            sprintf_s(buf, "  [%zu] %p type=double value=%.3f", i, (const void*)v, v->value.v_double);
+        else if (v->type == 7 || v->type == 10)
+            sprintf_s(buf, "  [%zu] %p type=int value=%lld", i, (const void*)v, (long long)v->value.v_int64);
+        else
+            sprintf_s(buf, "  [%zu] %p type=%d", i, (const void*)v, v->type);
+
+        g_api->Log(buf);
+    }
 }
 
 // ============================================================
@@ -430,26 +564,6 @@ static bool GetArrayElementSafe(const RValue* a, int idx, RValue* out)
 }
 
 // ============================================================
-// 值快照（资源 Hook去重）
-// ============================================================
-
-static void ClearValueSnapshots() { g_ModifiedDoubles.clear(); g_ModifiedInts.clear(); }
-
-static bool IsValueAlreadyModified(RValue* v)
-{
-    if (v->type == 0)for (double d : g_ModifiedDoubles) if (abs(d - v->value.v_double) < 0.001) return true;
-    else if (v->type == 7 || v->type == 10)
-        for (long long i : g_ModifiedInts) if (i == v->value.v_int64) return true;
-    return false;
-}
-
-static void RecordModifiedValue(RValue* v)
-{
-    if (v->type == 0) g_ModifiedDoubles.push_back(v->value.v_double);
-    else if (v->type == 7 || v->type == 10) g_ModifiedInts.push_back(v->value.v_int64);
-}
-
-// ============================================================
 // ReadGameVar
 // ============================================================
 
@@ -502,19 +616,38 @@ static int GetHighestPlayerCreatureLevel(void* p1, void* p2)
 // Hook：赋值拦截
 // ============================================================
 
-static void* __fastcall HookedAssign(RValue* dest, RValue* src)
+static void CaptureRewardWriteTarget(RValue* dest)
 {
-    if (src && g_InResource
-        && (src->type == 0 || src->type == 7 || src->type == 10)
-        && !IsValueAlreadyModified(src))
-    {
-        RValue safe = *src;
-        if (safe.type == 0) safe.value.v_double *= 2.0;
-        else                safe.value.v_int64 *= 2;
-        RecordModifiedValue(&safe);
-        return pOriginalAssign(dest, &safe);
-    }
-    return pOriginalAssign(dest, src);
+    if (!g_rewardCtx.active || g_rewardCtx.suppressCapture)
+        return;
+
+    if (!dest)
+        return;
+
+    if (!IsReadableRange(dest, sizeof(RValue)))
+        return;
+
+    if (!IsNumericRValue(dest))
+        return;
+
+    if (IsPtrOnCurrentStack(dest))
+        return;
+
+    g_rewardCtx.writeOrder.push_back(dest);
+}
+
+static void* __fastcall HookedAssign410(RValue* dest, void* src)
+{
+    void* ret = pOriginalAssign410(dest, src);
+    CaptureRewardWriteTarget(dest);
+    return ret;
+}
+
+static void* __fastcall HookedAssign630(RValue* dest, void* src)
+{
+    void* ret = pOriginalAssign630(dest, src);
+    CaptureRewardWriteTarget(dest);
+    return ret;
 }
 
 // ============================================================
@@ -538,13 +671,60 @@ static void* __fastcall HookedGodAddFavor(void* p1, void* p2, RValue* res, int a
 // Hook：资源
 // ============================================================
 
-static void* __fastcall HookedGetResources(void* p1, void* p2, RValue* p3)
+static void* __fastcall HookedGetRewardResources(void* p1, void* p2, RValue* p3)
 {
-    ClearValueSnapshots();
-    g_InResource = true;
-    pOriginalResources(p1, p2, p3);
-    g_InResource = false;
-    return p3;
+    static double g_RewardResourceMultiplier = 4.0;
+
+    // 防止意外重入
+    if (g_rewardCtx.active)
+        return pOriginalResources(p1, p2, p3);
+
+    g_rewardCtx.active = true;
+    g_rewardCtx.suppressCapture = false;
+    g_rewardCtx.writeOrder.clear();
+    QueryCurrentThreadStackRange(&g_rewardCtx.stackLow, &g_rewardCtx.stackHigh);
+
+    void* ret = pOriginalResources(p1, p2, p3);
+
+    // 关闭捕获，开始后处理
+    g_rewardCtx.suppressCapture = true;
+
+    // 按“最后 5 个唯一非栈数值目标”作为最终 reward slot
+    std::vector<RValue*> targets = CollectLastUniqueTargets(g_rewardCtx.writeOrder, 5);
+
+    if (targets.size() == 5)
+    {
+        //if (g_api)g_api->Log("RewardResources: captured 5 final reward targets, applying x2 post-scale.");
+
+        for (RValue* v : targets)
+        {
+            if (!v || !IsReadableRange(v, sizeof(RValue)))
+                continue;
+
+            ScaleRValueInPlace(v, g_RewardResourceMultiplier);
+        }
+
+        //LogRewardTargets("RewardResources post-scale targets", targets);
+    }
+    else
+    {
+        if (g_api)
+        {
+            char buf[128];
+            sprintf_s(buf,
+                "RewardResources: target capture mismatch, expected 5 got %zu; post-scale skipped.",
+                targets.size());
+            g_api->Log(buf);
+        }
+    }
+
+    g_rewardCtx.writeOrder.clear();
+    g_rewardCtx.stackLow = 0;
+    g_rewardCtx.stackHigh = 0;
+    g_rewardCtx.suppressCapture = false;
+    g_rewardCtx.active = false;
+
+    return ret;
 }
 
 // ============================================================
@@ -902,15 +1082,14 @@ extern "C" __declspec(dllexport) void InitializeMod(ModLoaderAPI* api)
     if (MH_Initialize() != MH_OK) return;
 
     // AOB 特征码
-    const char* resAOB = "41 54 41 55 41 56 41 57 48 8d a8 58 fe ff ff 48 81 ec 70 02 00 00 0f 29 70 b8 48 8b fa 48 8b d9 33 f6 89 b5 b0 01 00 00 48 8b 05 ?? ?? ????";
+    const char* resAOB = "41 54 41 55 41 56 41 57 48 8d a8 58 fe ff ff 48 81 ec 70 02 00 00 0f 29 70 b8 48 8b fa 48 8b d9 33 f6 89 b5 b0 01 00 00 48 8b 05 ?? ?? ?? ??";
     const char* favorAOB = "41 54 41 55 41 56 41 57 48 8d a8 68 fe ff ff 48 81 ec 60 02 00 00 0f 29 70 b8 0f 29 78 a8 41 8b f1 49 8b f8";
-    const char* assignAOB = "44 8b 49 0c 48 8b fa 44 89 51 0c 8b 42 08 ba 01 00 00 00 89 41 08 44 8b c2 41 8b ca 83 e1 1f 41 d3 e0";
     const char* emblemAOB = "41 54 41 55 41 56 41 57 48 8d ?? ?? ?? 48 81 ec f0 00 00 00 4c 8b e2 4c 8b f1 48 8b 1d 67 8a c7 02 48 89 5d 67";
     const char* lootboxAOB = "48 8d a8 e8 fb ff ff 48 81 ec d8 04 00 00 0f 29 70 a8 0f 29 78 98 44 0f 29 40 88 44 0f 29 88 78 ff ff ff 44 0f 29 90 68 ff ff ff 44 0f 29 98 58 ff ff ff 41 8b f9";
     const char* lootAOB = "48 8d ac 24 d0 e8 ff ff b8 30 18 00 00 e8 ?? ?? ?? ?? 48 2b e0 0f 29 b4 24 20 18 00 00 0f 29 bc 24 10 18 00 00 44 0f 29 84 24 00 18 00 00";
     const char* createMiscAOB = "48 8d 6c 24 d1 48 81 ec f0 00 00 00 45 8b e1 4d 8b f8 48 8b fa 48 8b f1 48 8b 1d ?? ?? ?? ?? 48 89 5d 5f 48 8d 05 66 7d dd 06";
     const char* materialKeyAOB = "48 8d 6c 24 c9 48 81 ec f0 00 00 00 4c 8b e2 4c 8b f1 48 8b 1d ?? ?? ?? ?? 48 89 5d 67 48 8d 05 9c d2 b0 01";
-    const char* createMaterialAOB = "48 8d 6c 24 d1 48 81 ec f0 00 00 00 45 8b e1 4d 8b f8 48 8b fa 48 8b f1 48 8b 1d ?? ?? ?? ?? 48 89 5d 5f 48 8d 05 4e81 dd 06";
+    const char* createMaterialAOB = "48 8d 6c 24 d1 48 81 ec f0 00 00 00 45 8b e1 4d 8b f8 48 8b fa 48 8b f1 48 8b 1d ?? ?? ?? ?? 48 89 5d 5f 48 8d 05 4e 81 dd 06";
     const char* getLevelAOB = "48 8d 68 98 48 81 ec 30 01 00 00 0f 29 70 b8 0f 29 78 a8 44 0f 29 40 98 4d 8b f8 4c 8b ea 4c 8b e1 48 8b 1d 8e 3d 89 03";
     const char* luckCapAOB = "ba 64 00 00 00 e8 22 8d a9 f9";
     const char* nsRare1AOB = "F2 44 0F 11 8D F8 04 00 00 41 B1 01 F2 0F 10 15 ?? ?? ?? ?? 48 8D 95 F8 04 00 00";
@@ -929,7 +1108,6 @@ extern "C" __declspec(dllexport) void InitializeMod(ModLoaderAPI* api)
     // 扫描
     uintptr_t fRes = api->FindPattern(resAOB);
     uintptr_t fFavor = api->FindPattern(favorAOB);
-    uintptr_t fAssign = api->FindPattern(assignAOB);
     uintptr_t fEmblem = api->FindPattern(emblemAOB);
     uintptr_t fLootbox = api->FindPattern(lootboxAOB);
     uintptr_t fLoot = api->FindPattern(lootAOB);
@@ -982,12 +1160,27 @@ extern "C" __declspec(dllexport) void InitializeMod(ModLoaderAPI* api)
         api->Log("TalismanMaxRank: address not found, hook skipped");
     }
 
-    // ── 主要Hooks ────────────────────────────────────────────
-    if (fRes && fFavor && fAssign && fEmblem && fLootbox && fLevel && fLoot)
+	//战斗资源赋值help
+    uintptr_t fAssign410 = AddrFromImageVa(kFUN_14028c410);
+    uintptr_t fAssign630 = AddrFromImageVa(kFUN_14028c630);
+
+    if (fAssign410 && fAssign630)
     {
-        MH_CreateHook((LPVOID)(fAssign - 17), &HookedAssign, (LPVOID*)&pOriginalAssign);
-        MH_CreateHook((LPVOID)(fRes - 18), &HookedGetResources, (LPVOID*)&pOriginalResources);
-        MH_CreateHook((LPVOID)(fFavor - 18), &HookedGodAddFavor, (LPVOID*)&pOriginalFavor);
+        MH_CreateHook((LPVOID)fAssign410, &HookedAssign410, (LPVOID*)&pOriginalAssign410);
+        MH_CreateHook((LPVOID)fAssign630, &HookedAssign630, (LPVOID*)&pOriginalAssign630);
+        if (g_api)
+        {
+            char buf[128];
+            sprintf_s(buf, "RewardResources Assign hook successfully installed.");
+            g_api->Log(buf);
+        }
+    }
+
+    // ── 主要Hooks ────────────────────────────────────────────
+    if (fRes && fFavor && fEmblem && fLootbox && fLevel && fLoot)
+    {
+        MH_CreateHook((LPVOID)(fRes - 18), &HookedGetRewardResources, (LPVOID*)&pOriginalResources);
+        MH_CreateHook((LPVOID)(fFavor - 18), &HookedGodAddFavor, (LPVOID*)&pOriginalFavor); 
         MH_CreateHook((LPVOID)(fEmblem - 16), &HookedEmblemKeyPress, (LPVOID*)&pOriginalEmblemKeyPress);
         MH_CreateHook((LPVOID)(fLootbox - 27), &HookedLootBox, (LPVOID*)&pOriginalLootBox);
         MH_CreateHook((LPVOID)(fLoot - 21), &HookedInvLoot, (LPVOID*)&pOriginalInvLoot);
