@@ -1,6 +1,6 @@
 # Better Game
 
-* 版本 / Version: 1.1
+* 版本 / Version: 1.17
 * 作者 / Author: 紫心醉梦
 * 框架 / Framework: [Siralim Ultimate Mod Loader](https://github.com/yt213587946/Siralim-Ultimate-Mod-Loader/releases/tag/v1.0.0)
 
@@ -10,7 +10,7 @@ A comprehensive enhancement mod that improves resource acquisition efficiency, c
 
 #### 1. More Base Resources
 
-* Battle resource acquisition x2
+* Battle resource acquisition x10
 * Chest loot quantity x3
 * God favor acquisition x10
 
@@ -19,8 +19,8 @@ A comprehensive enhancement mod that improves resource acquisition efficiency, c
 When picking up a medal, receive additional medals of the same type:
 
 * Base additional quantity: 4
-* Bonus based on the highest level creature in your party (+1 per 20 levels)
-* Additional quantity cap: 25 (maximum total of 30)
+* Bonus based on the highest level creature in your party (+1 per 10 levels)
+* Additional quantity cap: 666
 
 #### 3. More Materials
 
@@ -64,6 +64,16 @@ Removes the filtering restriction on "already used creatures" in the fusion syst
 #### 13\. Master of All and Noble Perk Enhanced
 
 * Master of All maximum level changed to 5, Noble effect doubled
+
+#### 14\. Realm Depth Jump
+
+Completing a realm quest at the current maximum depth can unlock multiple maximum-depth levels at once.
+
+* Set the jump amount with 【Jump】under 【RealmDepth】in【BetterGame.ini】; valid range: 1-25
+* 【Jump=1】: Keeps the original behavior and unlocks only 1 level each time
+* 【Jump=2】: For example, completing the quest at maximum depth 78 unlocks depth 80
+* Only applies when quest completion causes the game to increase the maximum realm depth; it does not affect manual Teleportation Shrine selection or save loading
+* The original behavior is retained while the maximum realm depth is 63 or lower to avoid skipping story progression
 
 ### Important Notes
 
@@ -138,6 +148,16 @@ This mod significantly alters the game's numerical balance.
 #### 13\. 万物大师和贵族perk加强
 
 * 万物大师最高等级改为5级，贵族效果翻倍
+
+#### 14\. 领域深度跳跃
+
+完成当前最高深度的领域任务后，可一次解锁多层最大领域深度。
+
+* 在配置文件【BetterGame.ini】的【RealmDepth】中通过【Jump】设置跳跃层数，范围为 1-25
+* 【Jump= 1】：保持原版行为，每次只提升 1 最大深度
+* 【Jump= 2】：每次提升 2 最大深度
+* 仅在任务完成且游戏原版确实提升最大领域深度时生效
+* 最大领域深度不超过 63 时保持原版行为，避免跳过剧情阶段
 
 
 ### 注意事项
